@@ -40,7 +40,10 @@ locust
 ```
 
 Buka browser ke **`http://localhost:8089`**, lalu isi form-nya:
-1. **Number of users**: isi sebagai *worker pool* (misal **`20`** untuk multiplier kecil, atau **`80`–`150`** untuk `1.0` / 100% ke atas). Jangan khawatir—skrip ini otomatis membatasi total TPS sesuai **`Multiplier`**, bukan sesuai jumlah user!
+1. **Number of users**: isi sebagai *worker pool* untuk ke-12 endpoint independen:
+   - Untuk `smoke`: minimal **`24`** (atau **`60`** jika endpoint lambat, agar tiap endpoint dapat minimal 2–5 worker).
+   - Untuk `peak` / `coincident`: minimal **`80`–`150`** agar endpoint dengan porsi kecil (1 TPS) tetap kebagian worker.
+   *(Skrip ini tetap membatasi total TPS sesuai **`Multiplier`**, bukan sesuai jumlah user!)*
 2. **Ramp up**: misal `10` (naik perlahan dalam 10 detik).
 3. **Multiplier**: ketik bebas sesuai kebutuhan kamu:
    - `0.01` = **1%** dari p99.9 (~0,66 TPS)
