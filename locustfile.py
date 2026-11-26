@@ -1,4 +1,4 @@
-from locust import HttpUser, events, task
+from locust import HttpUser, constant, events, task
 
 import csv
 import os
@@ -13,27 +13,33 @@ import config
 from auth import auth_manager
 
 # ==============================================================================
-# 1. Custom Arguments di Locust Web UI & CLI (Multiplier & Scenario)
+# 1. Custom Arguments di Locust Web UI & CLI (Scenario & Delay per Step)
 # ==============================================================================
 @events.init_command_line_parser.add_listener
 def on_init_command_line_parser(parser):
     parser.add_argument(
-        "--multiplier",
-        type=float,
-        default=config.DEFAULT_MULTIPLIER,
-        help="Pengali target p99.9 (contoh: 0.01 = 1%%, 0.1 = 10%%, 1.0 = 100%%, 1.5 = 150%%)",
-    )
-    parser.add_argument(
         "--scenario",
         type=str,
-        choices=["peak", "coincident", "smoke"],
+        choices=["daily", "peak", "coincident", "smoke"],
         default=config.DEFAULT_SCENARIO,
-        help="Profil rate dasar: peak (66 TPS), coincident (76 TPS), smoke (12 TPS)",
+        help="Profil proporsi trafik: daily (rasio Req/day produksi), peak (p99.9 mix), coincident, atau smoke (1:1)",
+    )
+    parser.add_argument(
+        "--min-delay",
+        type=float,
+        default=config.STEP_DELAY_MIN,
+        help="Delay minimum (detik) setelah setiap request endpoint",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=float,
+        default=config.STEP_DELAY_MAX,
+        help="Delay maksimum (detik) setelah setiap request endpoint",
     )
 
 
 # ==============================================================================
-# 2. Loader Data Uji & Shared State (S9 duplicate ref, version cache, active counts)
+# 2. Loader Data Uji, Shared State, dan Profil Proporsi Journey
 # ==============================================================================
 def load_customers(filename: str = "customers.csv") -> list[dict[str, str]]:
     csv_path = os.path.join(os.path.dirname(__file__), "data", filename)
@@ -56,9 +62,71 @@ _version_lock = threading.Lock()
 _last_version_cache: dict[str, str] = {}
 _cif_update_locks: dict[str, threading.Lock] = {}
 
-_count_lock = threading.Lock()
-_active_counts: dict[str, int] = {}
-_active_rates: dict[str, float] = config.get_target_rates(config.DEFAULT_SCENARIO, config.DEFAULT_MULTIPLIER)
+# Probabilitas funnel per sesi agar urutan tetap realistis & proporsi hit mengikuti target produksi
+SCENARIO_PROFILES: dict[str, dict[str, float]] = {
+    # Target Req/day (1,469,731 total): byCifBank 549,113 | balance 301,330 | order_history 270,621 |
+    # ut_products 169,769 | validate 67,688 | invaccount/byCifBank 59,081 | nav 37,417 |
+    # sub 7,637 | inv_create 2,741 | create 1,950 | red 1,459 | update 925
+    "daily": {
+        "onboarding_prob": 1950.0 / 549113.0,
+        "validate_prob": (67688.0 - 1950.0) / 547163.0,
+        "invaccount_by_cif_prob": 59081.0 / 547163.0,
+        "extra_invaccount_prob": (2741.0 - 1950.0) / 547163.0,
+        "balance_latest_prob": 301330.0 / 547163.0,
+        "order_history_prob": 270621.0 / 547163.0,
+        "ut_products_prob": (169769.0 - 1950.0) / 547163.0,
+        "nav_given_products_prob": 37417.0 / (169769.0 - 1950.0),
+        "sub_prob": (7637.0 - 1950.0) / 547163.0,
+        "red_prob": 1459.0 / 547163.0,
+        "update_prob": 925.0 / 547163.0,
+    },
+    # Target ratio: byCifBank 22.8, balance 12.5, order_history 11.2, ut_products 7.0,
+    # validate 2.8, invaccount/byCifBank 2.5, sub 2.0, nav 1.6, create/inv_create/red/update 1.0
+    "peak": {
+        "onboarding_prob": 1.0 / 22.8,
+        "validate_prob": 1.8 / 21.8,
+        "invaccount_by_cif_prob": 2.5 / 21.8,
+        "extra_invaccount_prob": 0.0,
+        "balance_latest_prob": 12.5 / 21.8,
+        "order_history_prob": 11.2 / 21.8,
+        "ut_products_prob": 6.0 / 21.8,
+        "nav_given_products_prob": 1.6 / 6.0,
+        "sub_prob": 1.0 / 21.8,
+        "red_prob": 1.0 / 21.8,
+        "update_prob": 1.0 / 21.8,
+    },
+    # Target ratio: byCifBank 22.0, balance 14.0, order_history 12.0, ut_products 8.0,
+    # validate 5.0, invaccount/byCifBank 5.0, nav 4.0, sub 2.0, create/inv_create/red/update 1.0
+    "coincident": {
+        "onboarding_prob": 1.0 / 22.0,
+        "validate_prob": 4.0 / 21.0,
+        "invaccount_by_cif_prob": 5.0 / 21.0,
+        "extra_invaccount_prob": 0.0,
+        "balance_latest_prob": 14.0 / 21.0,
+        "order_history_prob": 12.0 / 21.0,
+        "ut_products_prob": 7.0 / 21.0,
+        "nav_given_products_prob": 4.0 / 7.0,
+        "sub_prob": 1.0 / 21.0,
+        "red_prob": 1.0 / 21.0,
+        "update_prob": 1.0 / 21.0,
+    },
+}
+
+_VALID_SCENARIOS = ("daily", "peak", "coincident", "smoke")
+_active_scenario: str = config.DEFAULT_SCENARIO if config.DEFAULT_SCENARIO in _VALID_SCENARIOS else "daily"
+_delay_bounds: tuple[float, float] = (config.STEP_DELAY_MIN, config.STEP_DELAY_MAX)
+
+
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    """Baca konfigurasi scenario, min-delay, dan max-delay saat tes dimulai."""
+    global _active_scenario, _delay_bounds
+    parsed = environment.parsed_options
+    scenario = str(getattr(parsed, "scenario", config.DEFAULT_SCENARIO)).strip().lower()
+    _active_scenario = scenario if scenario in _VALID_SCENARIOS else "daily"
+    min_d = max(0.0, float(getattr(parsed, "min_delay", config.STEP_DELAY_MIN)))
+    max_d = max(min_d, float(getattr(parsed, "max_delay", config.STEP_DELAY_MAX)))
+    _delay_bounds = (min_d, max_d)
 
 
 def next_partner_ref(prefix: str, is_sub: bool) -> str:
@@ -82,198 +150,105 @@ def _get_cif_lock(cif: str) -> threading.Lock:
         return _cif_update_locks[cif]
 
 
+def _extract_version_from_response(resp) -> str | None:
+    if resp is None or resp.status_code != 200:
+        return None
+    try:
+        return (resp.json().get("data") or {}).get("lastVersionDate")
+    except Exception:
+        return None
+
+
 def _fetch_version_quietly(cif: str) -> str | None:
-    """Ambil lastVersionDate tanpa masuk hitungan metrik GET byCifBank di Locust."""
+    """Ambil lastVersionDate terbaru di dalam lock CIF agar tidak basi oleh GET paralel."""
     path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/byCifBank/{cif}"
     url = f"{config.CUSTOMER_BASE_URL}{path}"
     headers = auth_manager.build_headers("GET", path, None)
     try:
-        resp = raw_requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            return (resp.json().get("data") or {}).get("lastVersionDate")
+        resp = raw_requests.get(url, headers=headers, timeout=30)
+        return _extract_version_from_response(resp)
     except Exception:
-        pass
-    return None
+        return None
 
 
 # ==============================================================================
-# 3. Base User Class Independen per Endpoint (Open-Model Arrival Rate)
+# 3. Helper Endpoint Bersama untuk User Journey
 # ==============================================================================
-class BaseAvaEndpointUser(HttpUser):
-    abstract = True
-    host = config.BASE_URL
-    endpoint_key: str = ""
+class AvaEndpointMixin:
+    """Kumpulan pemanggilan 12 endpoint AVA dengan delay otomatis setelah setiap hit."""
 
-    def on_start(self):
-        self._last_task_duration = 0.0
-        with _count_lock:
-            _active_counts[self.endpoint_key] = _active_counts.get(self.endpoint_key, 0) + 1
+    def _pause_after_hit(self):
+        min_d, max_d = _delay_bounds
+        if max_d > 0:
+            time.sleep(random.uniform(min_d, max_d))
 
-    def on_stop(self):
-        with _count_lock:
-            current = _active_counts.get(self.endpoint_key, 1)
-            _active_counts[self.endpoint_key] = max(0, current - 1)
-
-    def wait_time(self):
-        """Setiap endpoint punya pacing independen: endpoint_tps = base_tps * multiplier."""
-        endpoint_tps = _active_rates.get(self.endpoint_key, 1.0)
-        with _count_lock:
-            n_users = max(1, _active_counts.get(self.endpoint_key, 1))
-        tps_per_user = endpoint_tps / n_users
-        target_interval = 1.0 / max(0.0001, tps_per_user)
-        return max(0.0, target_interval - self._last_task_duration)
-
-    def _send(self, base_url: str, method: str, path: str, name: str, body: dict | list | None = None):
+    def _send(self, base_url: str, method: str, path: str, name: str, body: dict | list | None = None, pause: bool = True):
         headers = auth_manager.build_headers(method, path, body)
         url = f"{base_url}{path}"
         kwargs = {"headers": headers, "name": name, "catch_response": True, "timeout": 30}
         if body is not None:
             kwargs["json"] = body
-        with self.client.request(method, url, **kwargs) as resp:
-            if resp.status_code >= 400:
-                snippet = resp.text.replace("\n", " ").strip()[:250]
-                resp.failure(f"HTTP {resp.status_code}: {snippet}")
-            else:
-                resp.success()
-            return resp
-
-    @task
-    def execute_endpoint(self):
-        customer = random.choice(CUSTOMERS)
-        start = time.perf_counter()
         try:
-            self.run_request(customer)
+            with self.client.request(method, url, **kwargs) as resp:
+                if getattr(resp, "error", None) is not None or resp.status_code == 0:
+                    resp.failure(str(getattr(resp, "error", None) or "Request error / timeout"))
+                elif resp.status_code >= 400:
+                    snippet = resp.text.replace("\n", " ").strip()[:250]
+                    resp.failure(f"HTTP {resp.status_code}: {snippet}")
+                else:
+                    resp.success()
+                return resp
         finally:
-            self._last_task_duration = time.perf_counter() - start
+            if pause:
+                self._pause_after_hit()
 
-    def run_request(self, c: dict[str, str]):
-        raise NotImplementedError
+    def call_validate_user(self, cif: str, mobile: str, birth_date: str):
+        path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/validate-user"
+        body = {
+            "cifBank": cif,
+            "mobileContactNo": mobile,
+            "birthDate": birth_date,
+        }
+        return self._send(config.CUSTOMER_BASE_URL, "POST", path, "POST customer-personal/validate-user", body=body)
 
-
-# ==============================================================================
-# 4. 12 User Class Independen (1 Class = 1 Endpoint AVA)
-# ==============================================================================
-class CustomerByCifUser(BaseAvaEndpointUser):
-    endpoint_key = "customer_by_cif"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/byCifBank/{c['cifBank']}"
+    def call_get_customer_by_cif(self, cif: str) -> str | None:
+        path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/byCifBank/{cif}"
         resp = self._send(config.CUSTOMER_BASE_URL, "GET", path, "GET customer-personal/byCifBank")
-        if resp is not None and resp.status_code == 200:
-            try:
-                version = (resp.json().get("data") or {}).get("lastVersionDate")
-                if version:
-                    with _version_lock:
-                        _last_version_cache[c["cifBank"]] = version
-            except Exception:
-                pass
+        version = _extract_version_from_response(resp)
+        if version:
+            with _version_lock:
+                _last_version_cache[cif] = version
+        return version
 
+    def call_get_invaccount_by_cif(self, cif: str):
+        path = f"{config.CUSTOMER_PREFIX}/v1/invaccount/byCifBank/{cif}"
+        return self._send(config.CUSTOMER_BASE_URL, "GET", path, "GET invaccount/byCifBank")
 
-class BalanceLatestUser(BaseAvaEndpointUser):
-    endpoint_key = "balance_latest"
+    def call_get_balance_latest(self, cif: str):
+        path = f"{config.UT_PREFIX}/v1/ut/balance-latest/{cif}"
+        return self._send(config.UT_BASE_URL, "GET", path, "GET ut/balance-latest")
 
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.UT_PREFIX}/v1/ut/balance-latest/{c['cifBank']}"
-        self._send(config.UT_BASE_URL, "GET", path, "GET ut/balance-latest")
+    def call_post_order_history(self, cif: str):
+        path = f"{config.TRANSACTION_PREFIX}/v1/order-histories/history/byCifBank/{cif}"
+        return self._send(config.TRANSACTION_BASE_URL, "POST", path, "POST order-histories/history", body={})
 
-
-class OrderHistoryUser(BaseAvaEndpointUser):
-    endpoint_key = "order_history"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.TRANSACTION_PREFIX}/v1/order-histories/history/byCifBank/{c['cifBank']}"
-        self._send(config.TRANSACTION_BASE_URL, "POST", path, "POST order-histories/history", body={})
-
-
-class UtProductsUser(BaseAvaEndpointUser):
-    endpoint_key = "ut_products"
-
-    def run_request(self, c: dict[str, str]):
+    def call_post_ut_products(self, cif: str):
         path = f"{config.UT_PREFIX}/v1/ut/products"
         body = {
-            "cifBank": c["cifBank"],
+            "cifBank": cif,
             "recommendation": False,
             "sort": "totalAum asc",
             "timePeriod": "",
             "size": 20,
             "offset": 0,
         }
-        self._send(config.UT_BASE_URL, "POST", path, "POST ut/products", body=body)
+        return self._send(config.UT_BASE_URL, "POST", path, "POST ut/products", body=body)
 
+    def call_get_nav_histories(self, product_code: str):
+        path = f"{config.UT_PREFIX}/v1/ut/products/nav-histories/{product_code}?type=all"
+        return self._send(config.UT_BASE_URL, "GET", path, "GET products/nav-histories")
 
-class ValidateUser(BaseAvaEndpointUser):
-    endpoint_key = "validate_user"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/validate-user"
-        body = {
-            "cifBank": c["cifBank"],
-            "mobileContactNo": c["mobileContactNo"],
-            "birthDate": c["birthDate"],
-        }
-        self._send(config.CUSTOMER_BASE_URL, "POST", path, "POST customer-personal/validate-user", body=body)
-
-
-class InvAccountByCifUser(BaseAvaEndpointUser):
-    endpoint_key = "invaccount_by_cif"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.CUSTOMER_PREFIX}/v1/invaccount/byCifBank/{c['cifBank']}"
-        self._send(config.CUSTOMER_BASE_URL, "GET", path, "GET invaccount/byCifBank")
-
-
-class NavHistoriesUser(BaseAvaEndpointUser):
-    endpoint_key = "nav_histories"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.UT_PREFIX}/v1/ut/products/nav-histories/{c['productCode']}?type=all"
-        self._send(config.UT_BASE_URL, "GET", path, "GET products/nav-histories")
-
-
-class TrxSubscriptionUser(BaseAvaEndpointUser):
-    endpoint_key = "trx_subscription"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.UT_PREFIX}/v1/transaction/subscription"
-        body = {
-            "orders": [
-                {
-                    "cifBank": c["cifBank"],
-                    "invAccountNo": c["invAccountNo"],
-                    "productCode": c["productCode"],
-                    "stlAccountNo": c["stlAccountNo"],
-                    "salesId": config.DEFAULT_SALES_ID,
-                    "branchId": config.DEFAULT_BRANCH_ID,
-                    "trxAmount": 1000.00,
-                    "appliedCalculationType": 0,
-                    "appliedFeeType": 0,
-                    "feeByRate": 0,
-                    "feeByAmount": 0,
-                    "partnerRefNo": next_partner_ref("SUB", is_sub=True),
-                }
-            ]
-        }
-        self._send(config.UT_BASE_URL, "POST", path, "POST transaction/subscription", body=body)
-
-
-class InvAccountCreateUser(BaseAvaEndpointUser):
-    endpoint_key = "invaccount_create"
-
-    def run_request(self, c: dict[str, str]):
-        path = f"{config.CUSTOMER_PREFIX}/v1/invaccount/create"
-        unique_inv = f"I26{uuid.uuid4().hex[:8].upper()}"
-        body = {
-            "invAccountNo": unique_inv,
-            "invAccountName": f"LoadTest {unique_inv}",
-            "cifBank": c["cifBank"],
-        }
-        self._send(config.CUSTOMER_BASE_URL, "POST", path, "POST invaccount/create", body=body)
-
-
-class CustomerCreateUser(BaseAvaEndpointUser):
-    endpoint_key = "customer_create"
-
-    def run_request(self, c: dict[str, str]):
+    def call_create_customer(self):
         path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/create"
         unique_cif = f"LT{uuid.uuid4().hex[:10].upper()}"
         unique_id_num = str(random.randint(10**15, 10**16 - 1))
@@ -317,15 +292,43 @@ class CustomerCreateUser(BaseAvaEndpointUser):
                 "emailAddress": f"{unique_cif.lower()}@gcash.com",
             },
         }
-        self._send(config.CUSTOMER_BASE_URL, "POST", path, "POST customer-personal/create", body=body)
+        return self._send(config.CUSTOMER_BASE_URL, "POST", path, "POST customer-personal/create", body=body)
 
+    def call_create_invaccount(self, cif: str):
+        path = f"{config.CUSTOMER_PREFIX}/v1/invaccount/create"
+        unique_inv = f"I26{uuid.uuid4().hex[:8].upper()}"
+        body = {
+            "invAccountNo": unique_inv,
+            "invAccountName": f"LoadTest {unique_inv}",
+            "cifBank": cif,
+        }
+        return self._send(config.CUSTOMER_BASE_URL, "POST", path, "POST invaccount/create", body=body)
 
-class TrxRedemptionUser(BaseAvaEndpointUser):
-    endpoint_key = "trx_redemption"
+    def call_subscription(self, cif: str, inv_account_no: str, product_code: str, stl_account_no: str):
+        path = f"{config.UT_PREFIX}/v1/transaction/subscription"
+        body = {
+            "orders": [
+                {
+                    "cifBank": cif,
+                    "invAccountNo": inv_account_no,
+                    "productCode": product_code,
+                    "stlAccountNo": stl_account_no,
+                    "salesId": config.DEFAULT_SALES_ID,
+                    "branchId": config.DEFAULT_BRANCH_ID,
+                    "trxAmount": 1000.00,
+                    "appliedCalculationType": 0,
+                    "appliedFeeType": 0,
+                    "feeByRate": 0,
+                    "feeByAmount": 0,
+                    "partnerRefNo": next_partner_ref("SUB", is_sub=True),
+                }
+            ]
+        }
+        return self._send(config.UT_BASE_URL, "POST", path, "POST transaction/subscription", body=body)
 
-    def run_request(self, c: dict[str, str]):
-        rc = random.choice(REDEMPTION_CUSTOMERS)
+    def call_redemption(self, rc: dict[str, str]):
         path = f"{config.UT_PREFIX}/v1/transaction/redemption"
+        redeem_unit = config.PRODUCT_MIN_REDEMPTION_UNITS.get(rc["productCode"], config.REDEMPTION_BY_UNIT)
         body = {
             "orders": [
                 {
@@ -336,7 +339,7 @@ class TrxRedemptionUser(BaseAvaEndpointUser):
                     "salesId": config.DEFAULT_SALES_ID,
                     "branchId": config.DEFAULT_BRANCH_ID,
                     "redemptionType": 1,
-                    "redemptionByUnit": 100.0,
+                    "redemptionByUnit": redeem_unit,
                     "appliedFeeType": 0,
                     "feeByRate": 0,
                     "feeByAmount": 0,
@@ -344,105 +347,153 @@ class TrxRedemptionUser(BaseAvaEndpointUser):
                 }
             ]
         }
-        self._send(config.UT_BASE_URL, "POST", path, "POST transaction/redemption", body=body)
+        return self._send(config.UT_BASE_URL, "POST", path, "POST transaction/redemption", body=body)
 
-
-class CustomerUpdateUser(BaseAvaEndpointUser):
-    endpoint_key = "customer_update"
-
-    def run_request(self, c: dict[str, str]):
+    def call_update_customer(self, c: dict[str, str], session_version: str | None = None):
         cif = c["cifBank"]
-        # Lock per cifBank agar 2 worker tidak balapan update cif yang sama & bentrok version
-        with _get_cif_lock(cif):
-            with _version_lock:
-                version = _last_version_cache.pop(cif, None)
-            if not version:
+        try:
+            with _get_cif_lock(cif):
                 version = _fetch_version_quietly(cif)
+                if not version:
+                    with _version_lock:
+                        version = _last_version_cache.pop(cif, None) or session_version
 
-            path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/update/{cif}"
-            body = {
-                "cifBank": cif,
-                "firstName": "LoadTest",
-                "lastName": "Updated",
-                "gender": None,
-                "citizenship": -1,
-                "countryCode": "PH",
-                "birthPlace": "Manila",
-                "birthDate": c["birthDate"],
-                "maritalStatus": "9f9c64cd-f08d-006e-e043-c0a844b7006e",
-                "spouseName": "-",
-                "spouseDateOfBirth": "1900-01-01",
-                "educationBackground": "9f9c64cd-f092-006e-e043-c0a844b7006e",
-                "religion": "9f9c64cd-f095-006e-e043-c0a844b7006e",
-                "income": "9f9c64cd-f0ad-006e-e043-c0a844b7006e",
-                "fundSource": "9f9c64cd-f139-006e-e043-c0a844b7006e",
-                "investmentPurposes": ["f49f3b26-d3d0-449f-af09-13ec18be4927"],
-                "identifications": [
-                    {
-                        "idNumber": "1234567890123456",
-                        "idOwnerName": "LoadTest Updated",
-                        "idTypeCode": "PAS",
-                        "issuedDate": "2020-01-20",
-                        "expiredDate": "2031-05-28",
-                    }
-                ],
-                "businessProfile": {
-                    "organizationName": "GCash Inc",
-                    "officeAddress": "BGC Taguig City",
-                    "professionCode": "PM",
-                },
-                "contact": {
-                    "residentPhoneNo": "0211234567",
-                    "mobilePhoneNo": c["mobileContactNo"],
-                    "emailAddress": f"{cif.lower()}@example.com",
-                },
-                "settlementAccount": [
-                    {
-                        "stlAccountNo": c["stlAccountNo"],
-                        "holderName": "LoadTest Updated",
-                        "accountTypeCode": "SAV",
-                        "bankId": config.DEFAULT_BANK_ID,
-                        "branchId": config.DEFAULT_BRANCH_ID,
-                    }
-                ],
-            }
-            if version:
-                body["lastVersionDate"] = version
-            self._send(config.CUSTOMER_BASE_URL, "PUT", path, "PUT customer-personal/update", body=body)
-
-
-ENDPOINT_USER_CLASSES = [
-    CustomerByCifUser,
-    BalanceLatestUser,
-    OrderHistoryUser,
-    UtProductsUser,
-    ValidateUser,
-    InvAccountByCifUser,
-    NavHistoriesUser,
-    TrxSubscriptionUser,
-    InvAccountCreateUser,
-    CustomerCreateUser,
-    TrxRedemptionUser,
-    CustomerUpdateUser,
-]
+                path = f"{config.CUSTOMER_PREFIX}/v1/customer-personal/update/{cif}"
+                body = {
+                    "cifBank": cif,
+                    "firstName": "LoadTest",
+                    "lastName": "Updated",
+                    "gender": None,
+                    "citizenship": -1,
+                    "countryCode": "PH",
+                    "birthPlace": "Manila",
+                    "birthDate": c["birthDate"],
+                    "maritalStatus": "9f9c64cd-f08d-006e-e043-c0a844b7006e",
+                    "spouseName": "-",
+                    "spouseDateOfBirth": "1900-01-01",
+                    "educationBackground": "9f9c64cd-f092-006e-e043-c0a844b7006e",
+                    "religion": "9f9c64cd-f095-006e-e043-c0a844b7006e",
+                    "income": "9f9c64cd-f0ad-006e-e043-c0a844b7006e",
+                    "fundSource": "9f9c64cd-f139-006e-e043-c0a844b7006e",
+                    "investmentPurposes": ["f49f3b26-d3d0-449f-af09-13ec18be4927"],
+                    "identifications": [
+                        {
+                            "idNumber": "1234567890123456",
+                            "idOwnerName": "LoadTest Updated",
+                            "idTypeCode": "PAS",
+                            "issuedDate": "2020-01-20",
+                            "expiredDate": "2031-05-28",
+                        }
+                    ],
+                    "businessProfile": {
+                        "organizationName": "GCash Inc",
+                        "officeAddress": "BGC Taguig City",
+                        "professionCode": "PM",
+                    },
+                    "contact": {
+                        "residentPhoneNo": "0211234567",
+                        "mobilePhoneNo": c["mobileContactNo"],
+                        "emailAddress": f"{cif.lower()}@example.com",
+                    },
+                    "settlementAccount": [
+                        {
+                            "stlAccountNo": c["stlAccountNo"],
+                            "holderName": "LoadTest Updated",
+                            "accountTypeCode": "SAV",
+                            "bankId": config.DEFAULT_BANK_ID,
+                            "branchId": config.DEFAULT_BRANCH_ID,
+                        }
+                    ],
+                }
+                if version:
+                    body["lastVersionDate"] = version
+                return self._send(config.CUSTOMER_BASE_URL, "PUT", path, "PUT customer-personal/update", body=body, pause=False)
+        finally:
+            self._pause_after_hit()
 
 
-@events.test_start.add_listener
-def on_test_start(environment, **kwargs):
-    """Atur bobot dan target rate 12 User Class saat tes dimulai (sesuai Scenario & Multiplier)."""
-    global _active_rates
-    parsed = environment.parsed_options
-    scenario = getattr(parsed, "scenario", config.DEFAULT_SCENARIO)
-    multiplier = getattr(parsed, "multiplier", config.DEFAULT_MULTIPLIER)
-    _active_rates = config.get_target_rates(scenario, multiplier)
+# ==============================================================================
+# 4. User Journey Realistis dengan Proporsi Sesuai Profil Produksi
+# ==============================================================================
+class AvaJourneyUser(AvaEndpointMixin, HttpUser):
+    host = config.BASE_URL
+    # Delay ditangani langsung setelah setiap HTTP hit (_pause_after_hit) agar step yang dilewati tidak ikut sleep.
+    wait_time = constant(0)
 
-    with _count_lock:
-        _active_counts.clear()
+    def _run_smoke_onboarding(self, c: dict[str, str]):
+        self.call_create_customer()
+        self.call_create_invaccount(c["cifBank"])
+        self.call_post_ut_products(c["cifBank"])
+        self.call_get_nav_histories(c["productCode"])
+        self.call_subscription(c["cifBank"], c["invAccountNo"], c["productCode"], c["stlAccountNo"])
+        self.call_post_order_history(c["cifBank"])
 
-    for user_cls in ENDPOINT_USER_CLASSES:
-        rate = _active_rates.get(user_cls.endpoint_key, 1.0)
-        user_cls.weight = max(1, round(rate * 10))
+    def _run_smoke_existing(self, c: dict[str, str]):
+        self.call_validate_user(c["cifBank"], c["mobileContactNo"], c["birthDate"])
+        version = self.call_get_customer_by_cif(c["cifBank"])
+        self.call_get_invaccount_by_cif(c["cifBank"])
+        self.call_get_balance_latest(c["cifBank"])
+        self.call_redemption(random.choice(REDEMPTION_CUSTOMERS))
+        self.call_update_customer(c, session_version=version)
 
-    # Paksa dispatcher membaca ulang weight terbaru jika user mengganti Scenario/Multiplier di Web UI
-    if environment.runner and hasattr(environment.runner, "_users_dispatcher"):
-        environment.runner._users_dispatcher = None
+    def _run_onboarding_session(self, c: dict[str, str]):
+        probe_cif = f"NEW{uuid.uuid4().hex[:9].upper()}"
+        probe_mobile = f"+63917{random.randint(1000000, 9999999)}"
+        self.call_validate_user(probe_cif, probe_mobile, "1990-05-15")
+        self.call_create_customer()
+        self.call_create_invaccount(c["cifBank"])
+        self.call_get_customer_by_cif(c["cifBank"])
+        self.call_post_ut_products(c["cifBank"])
+        self.call_subscription(c["cifBank"], c["invAccountNo"], c["productCode"], c["stlAccountNo"])
+
+    def _run_existing_session(self, c: dict[str, str], profile: dict[str, float]):
+        cif = c["cifBank"]
+        if random.random() < profile["validate_prob"]:
+            self.call_validate_user(cif, c["mobileContactNo"], c["birthDate"])
+
+        session_version = self.call_get_customer_by_cif(cif)
+
+        if random.random() < profile["invaccount_by_cif_prob"]:
+            self.call_get_invaccount_by_cif(cif)
+
+        if profile.get("extra_invaccount_prob", 0.0) > 0 and random.random() < profile["extra_invaccount_prob"]:
+            self.call_create_invaccount(cif)
+
+        if random.random() < profile["balance_latest_prob"]:
+            self.call_get_balance_latest(cif)
+
+        if random.random() < profile["order_history_prob"]:
+            self.call_post_order_history(cif)
+
+        if random.random() < profile["ut_products_prob"]:
+            self.call_post_ut_products(cif)
+            if random.random() < profile["nav_given_products_prob"]:
+                self.call_get_nav_histories(c["productCode"])
+
+        roll = random.random()
+        sub_cut = profile["sub_prob"]
+        red_cut = sub_cut + profile["red_prob"]
+        upd_cut = red_cut + profile["update_prob"]
+
+        if roll < sub_cut:
+            self.call_subscription(cif, c["invAccountNo"], c["productCode"], c["stlAccountNo"])
+        elif roll < red_cut:
+            self.call_redemption(random.choice(REDEMPTION_CUSTOMERS))
+        elif roll < upd_cut:
+            self.call_update_customer(c, session_version=session_version)
+
+    @task
+    def execute_user_session(self):
+        c = random.choice(CUSTOMERS)
+        if _active_scenario == "smoke":
+            if random.random() < 0.5:
+                self._run_smoke_onboarding(c)
+            else:
+                self._run_smoke_existing(c)
+            return
+
+        profile = SCENARIO_PROFILES[_active_scenario]
+        if random.random() < profile["onboarding_prob"]:
+            self._run_onboarding_session(c)
+        else:
+            self._run_existing_session(c, profile)
