@@ -15,6 +15,10 @@ TRANSACTION_PREFIX = os.getenv("TRANSACTION_PREFIX", "/transaction-service").rst
 ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").strip().lower() in ("1", "true", "yes", "on")
 DEFAULT_SCENARIO = os.getenv("LOAD_SCENARIO", "peak").strip().lower()
 DEFAULT_MULTIPLIER = float(os.getenv("LOAD_MULTIPLIER", "0.10"))
+STEP_DELAY_MIN = float(os.getenv("STEP_DELAY_MIN", "1.0"))
+STEP_DELAY_MAX = float(os.getenv("STEP_DELAY_MAX", "3.0"))
+NEW_USER_WEIGHT = int(os.getenv("NEW_USER_WEIGHT", "2"))
+EXISTING_USER_WEIGHT = int(os.getenv("EXISTING_USER_WEIGHT", "8"))
 
 LOGIN_ID = os.getenv("LOGIN_ID", "useradmin1")
 USER_ID = os.getenv("USER_ID", "585f37d3-6167-4cd6-84a3-17a9f7b2be90")

@@ -1,6 +1,6 @@
 # GCash -> AVA API Load Test (Locust)
 
-Panduan singkat untuk pemula menjalankan load test dengan **Multiplier** yang bisa diatur bebas (`0.01` = 1%, `0.10` = 10%, `1.0` = 100%, dst).
+Skrip load test dengan alur **User Journey berurutan** (`SequentialTaskSet`) dan **delay otomatis setelah setiap endpoint** agar simulasi trafik menyerupai perilaku user asli.
 
 ---
 
@@ -26,12 +26,25 @@ Copy-Item .env.example .env
 ```
 
 Edit `.env` sesuai kebutuhan:
-- `BASE_URL`: alamat API Gateway UAT (atau service lokal seperti `http://localhost:8083`).
-- `ENABLE_AUTH`: set `false` jika nembak service lokal tanpa gateway; set `true` jika nembak API Gateway yang butuh B2B Token & HMAC-SHA512.
+- `BASE_URL` / `CUSTOMER_BASE_URL` / `UT_BASE_URL` / `TRANSACTION_BASE_URL`: alamat service/gateway.
+- `ENABLE_AUTH`: `false` untuk service lokal tanpa gateway; `true` untuk API Gateway dengan B2B Token & HMAC-SHA512.
+- `STEP_DELAY_MIN` & `STEP_DELAY_MAX`: rentang delay (detik) setelah setiap request endpoint (default `1.0`–`3.0` detik).
+- `NEW_USER_WEIGHT` & `EXISTING_USER_WEIGHT`: perbandingan porsi user baru vs user existing (default `2:8`).
 
 ---
 
-## 2. Cara Menjalankan (Via Web UI — Paling Gampang)
+## 2. Alur User Journey
+
+1. **`NewCustomerUser` (bobot default 20%)**:
+   `validate-user` → `customer-personal/create` → `invaccount/create` → `customer-personal/byCifBank` → `ut/products` → `products/nav-histories` → `transaction/subscription` → `ut/balance-latest` → `order-histories/history`
+2. **`ExistingCustomerUser` (bobot default 80%)**:
+   `validate-user` → `customer-personal/byCifBank` *(ambil `lastVersionDate`)* → `invaccount/byCifBank` → `ut/balance-latest` → `order-histories/history` → `ut/products` → `products/nav-histories` → cabang aksi akhir (`60%` `subscription` / `25%` `redemption` / `15%` `PUT customer-personal/update`)
+
+Setelah **setiap** langkah endpoint di atas, Locust otomatis menunggu `random(min-delay, max-delay)` detik sebelum lanjut ke endpoint berikutnya.
+
+---
+
+## 3. Cara Menjalankan (Via Web UI)
 
 Pastikan `.venv` aktif, lalu jalankan:
 
@@ -39,41 +52,30 @@ Pastikan `.venv` aktif, lalu jalankan:
 locust
 ```
 
-Buka browser ke **`http://localhost:8089`**, lalu isi form-nya:
-1. **Number of users**: isi sebagai *worker pool* untuk ke-12 endpoint independen:
-   - Untuk `smoke`: minimal **`24`** (atau **`60`** jika endpoint lambat, agar tiap endpoint dapat minimal 2–5 worker).
-   - Untuk `peak` / `coincident`: minimal **`80`–`150`** agar endpoint dengan porsi kecil (1 TPS) tetap kebagian worker.
-   *(Skrip ini tetap membatasi total TPS sesuai **`Multiplier`**, bukan sesuai jumlah user!)*
-2. **Ramp up**: misal `10` (naik perlahan dalam 10 detik).
-3. **Multiplier**: ketik bebas sesuai kebutuhan kamu:
-   - `0.01` = **1%** dari p99.9 (~0,66 TPS)
-   - `0.10` = **10%** dari p99.9 (~6,6 TPS)
-   - `0.50` = **50%** dari p99.9 (~33 TPS)
-   - `1.0` = **100%** dari p99.9 (~66 TPS — target utama S3)
-   - `1.5` = **150%** (~99 TPS)
-4. **Scenario**: pilih `peak` (default 66 TPS), `coincident` (76 TPS), atau `smoke` (12 TPS).
-5. Klik **Start swarming**!
+Buka browser ke **`http://localhost:8089`**, lalu isi form:
+1. **Number of users**: jumlah concurrent user virtual (misal `10` untuk pemanasan, `30`–`100` untuk load lebih tinggi).
+2. **Ramp up**: misal `5` atau `10` user/detik.
+3. **Min delay / Max delay**: atur jeda antar endpoint dalam detik (default `1.0`–`3.0`).
+4. Klik **Start swarming**.
 
 ---
 
-## 3. Cara Menjalankan Tanpa Browser (CLI / Headless)
+## 4. Cara Menjalankan Tanpa Browser (CLI / Headless)
 
-Contoh menjalankan **10%** selama **5 menit**:
+Contoh menjalankan **20 user** selama **5 menit** dengan delay **1–3 detik** setelah setiap endpoint:
 
 ```powershell
-locust --headless --users 30 --spawn-rate 5 --run-time 5m --multiplier 0.10 --scenario peak
+locust --headless --users 20 --spawn-rate 5 --run-time 5m --min-delay 1.0 --max-delay 3.0
 ```
 
-Contoh menjalankan **100% (Peak S3)** selama **60 menit** sambil simpan laporan HTML:
+Simpan laporan HTML:
 
 ```powershell
-locust --headless --users 120 --spawn-rate 10 --run-time 60m --multiplier 1.0 --scenario peak --html report_s3.html
+locust --headless --users 50 --spawn-rate 5 --run-time 15m --min-delay 1.0 --max-delay 2.5 --html report_journey.html
 ```
 
 ---
 
-## 4. Menyiapkan Data Uji (`data/customers.csv`)
-File `data/customers.csv` saat ini berisi 3 contoh data dari report Postman/Enhancement. Untuk pengujian UAT yang akurat (Section 6), isi file tersebut dengan **minimal 50.000 baris** customer UAT dengan format kolom yang sama:
-```csv
-cifBank,invAccountNo,stlAccountNo,productCode,mobileContactNo,birthDate
-```
+## 5. Data Uji
+- `data/customers.csv`: data customer untuk user existing & fallback.
+- `data/redemption_customers.csv`: data customer khusus transaksi `redemption`.
