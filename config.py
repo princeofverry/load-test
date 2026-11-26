@@ -13,7 +13,7 @@ UT_PREFIX = os.getenv("UT_PREFIX", "/ut-service").rstrip("/")
 TRANSACTION_PREFIX = os.getenv("TRANSACTION_PREFIX", "/transaction-service").rstrip("/")
 
 ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").strip().lower() in ("1", "true", "yes", "on")
-DEFAULT_SCENARIO = os.getenv("LOAD_SCENARIO", "peak").strip().lower()
+DEFAULT_SCENARIO = os.getenv("LOAD_SCENARIO", "daily").strip().lower()
 DEFAULT_MULTIPLIER = float(os.getenv("LOAD_MULTIPLIER", "0.10"))
 STEP_DELAY_MIN = float(os.getenv("STEP_DELAY_MIN", "1.0"))
 STEP_DELAY_MAX = float(os.getenv("STEP_DELAY_MAX", "3.0"))
@@ -35,6 +35,28 @@ TOKEN_REFRESH_SECONDS = int(os.getenv("TOKEN_REFRESH_SECONDS", "800"))
 DEFAULT_SALES_ID = os.getenv("DEFAULT_SALES_ID", "46aaeb86-007f-4d72-b346-13ae9b514793")
 DEFAULT_BRANCH_ID = os.getenv("DEFAULT_BRANCH_ID", "b879defe-ee35-4314-9a46-4b87ef6216e7")
 DEFAULT_BANK_ID = os.getenv("DEFAULT_BANK_ID", "46aaeb86-007f-4d72-b346-13ae9b514793")
+REDEMPTION_BY_UNIT = float(os.getenv("REDEMPTION_BY_UNIT", "5.0"))
+PRODUCT_MIN_REDEMPTION_UNITS: dict[str, float] = {
+    "ATRGAIA": 5.0,
+    "ATRGMID": 2.0,
+    "ATRGMIP": 2.0,
+}
+
+# Basis trafik harian produksi (1,469,731 req/day, Avg 17.01 TPS)
+AVG_DAILY_RATES: dict[str, float] = {
+    "customer_by_cif": 6.36,
+    "balance_latest": 3.49,
+    "order_history": 3.13,
+    "ut_products": 1.96,
+    "validate_user": 0.78,
+    "invaccount_by_cif": 0.68,
+    "nav_histories": 0.43,
+    "trx_subscription": 0.09,
+    "invaccount_create": 0.03,
+    "customer_create": 0.02,
+    "trx_redemption": 0.02,
+    "customer_update": 0.01,
+}
 
 # Basis target TPS dari dokumen Section 3: "Peak (p99.9 mix): 61 TPS x share, writes floored" (~66 TPS)
 PEAK_P99_9_RATES: dict[str, float] = {
@@ -75,7 +97,9 @@ SMOKE_RATES: dict[str, float] = {key: 1.0 for key in PEAK_P99_9_RATES}
 def get_target_rates(scenario: str, multiplier: float) -> dict[str, float]:
     """Hitung target TPS tiap endpoint berdasarkan skenario dan multiplier."""
     scenario_key = (scenario or "peak").strip().lower()
-    if scenario_key == "coincident":
+    if scenario_key == "daily":
+        base = AVG_DAILY_RATES
+    elif scenario_key == "coincident":
         base = COINCIDENT_P99_9_RATES
     elif scenario_key == "smoke":
         base = SMOKE_RATES

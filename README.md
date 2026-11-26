@@ -1,6 +1,6 @@
 # GCash -> AVA API Load Test (Locust)
 
-Skrip load test dengan alur **User Journey berurutan** (`SequentialTaskSet`) dan **delay otomatis setelah setiap endpoint** agar simulasi trafik menyerupai perilaku user asli.
+Skrip load test berbasis **User Journey realistis** dengan **proporsi hit mengikuti trafik produksi** ([config.py](file:///H:/indivara/gcash/load-test/config.py)) dan **delay otomatis setelah setiap endpoint**.
 
 ---
 
@@ -9,73 +9,56 @@ Skrip load test dengan alur **User Journey berurutan** (`SequentialTaskSet`) dan
 Buka terminal di folder `H:\indivara\gcash\load-test`:
 
 ```powershell
-# Buat virtual environment Python
 python -m venv .venv
-
-# Aktifkan virtual environment
 .\.venv\Scripts\Activate.ps1
-
-# Install Locust & library pendukung
 pip install -r requirements.txt
-```
-
-Lalu copy file `.env.example` menjadi `.env`:
-
-```powershell
 Copy-Item .env.example .env
 ```
 
 Edit `.env` sesuai kebutuhan:
 - `BASE_URL` / `CUSTOMER_BASE_URL` / `UT_BASE_URL` / `TRANSACTION_BASE_URL`: alamat service/gateway.
 - `ENABLE_AUTH`: `false` untuk service lokal tanpa gateway; `true` untuk API Gateway dengan B2B Token & HMAC-SHA512.
+- `LOAD_SCENARIO`: `daily` (default), `peak`, `coincident`, atau `smoke`.
 - `STEP_DELAY_MIN` & `STEP_DELAY_MAX`: rentang delay (detik) setelah setiap request endpoint (default `1.0`–`3.0` detik).
-- `NEW_USER_WEIGHT` & `EXISTING_USER_WEIGHT`: perbandingan porsi user baru vs user existing (default `2:8`).
 
 ---
 
-## 2. Alur User Journey
+## 2. Alur & Proporsi Funnel User Journey (`AvaJourneyUser`)
 
-1. **`NewCustomerUser` (bobot default 20%)**:
-   `validate-user` → `customer-personal/create` → `invaccount/create` → `customer-personal/byCifBank` → `ut/products` → `products/nav-histories` → `transaction/subscription` → `ut/balance-latest` → `order-histories/history`
-2. **`ExistingCustomerUser` (bobot default 80%)**:
-   `validate-user` → `customer-personal/byCifBank` *(ambil `lastVersionDate`)* → `invaccount/byCifBank` → `ut/balance-latest` → `order-histories/history` → `ut/products` → `products/nav-histories` → cabang aksi akhir (`60%` `subscription` / `25%` `redemption` / `15%` `PUT customer-personal/update`)
+1. **Mode `daily` (default — mengikuti rasio tabel `Req/day` produksi, total 1.469.731 req/day / Avg 17.01 TPS)**:
+   - `GET customer-personal/byCifBank`: ~`37.4%` (`549,113/day`)
+   - `GET ut/balance-latest`: ~`20.5%` (`301,330/day`)
+   - `POST order-histories/history`: ~`18.4%` (`270,621/day`)
+   - `POST ut/products`: ~`11.6%` (`169,769/day`)
+   - `POST customer-personal/validate-user`: ~`4.6%` (`67,688/day`)
+   - `GET invaccount/byCifBank`: ~`4.0%` (`59,081/day`)
+   - `GET products/nav-histories`: ~`2.5%` (`37,417/day`)
+   - `POST transaction/subscription`: ~`0.52%` (`7,637/day`)
+   - `POST invaccount/create`: ~`0.19%` (`2,741/day`)
+   - `POST customer-personal/create`: ~`0.13%` (`1,950/day`)
+   - `POST transaction/redemption`: ~`0.10%` (`1,459/day`)
+   - `PUT customer-personal/update`: ~`0.06%` (`925/day`)
+2. **Mode `peak` (`p99.9` mix)**: menjaga alur journey dengan writes dinaikkan minimal `1.0` TPS (`22.8 : 12.5 : 11.2 : 7.0 : 2.8 : 2.5 : 2.0 : 1.6 : 1 : 1 : 1 : 1`).
+3. **Mode `coincident`**: alur journey sesuai puncak bersamaan (`22 : 14 : 12 : 8 : 5 : 5 : 4 : 2 : 1 : 1 : 1 : 1`).
+4. **Mode `smoke`**: membagi 50:50 dua alur berurutan sehingga ke-12 endpoint ter-hit dengan rasio **1:1**.
 
-Setelah **setiap** langkah endpoint di atas, Locust otomatis menunggu `random(min-delay, max-delay)` detik sebelum lanjut ke endpoint berikutnya.
+Delay `random(min-delay, max-delay)` hanya dijalankan **setelah request HTTP benar-benar ditembak**.
 
 ---
 
-## 3. Cara Menjalankan (Via Web UI)
+## 3. Cara Menjalankan
 
-Pastikan `.venv` aktif, lalu jalankan:
-
+### Via Web UI
 ```powershell
 locust
 ```
+Buka **`http://localhost:8089`**, lalu isi:
+- **Number of users**: jumlah concurrent user (misal `25`–`50` untuk lokal, `50`–`150` untuk UAT).
+- **Ramp up**: misal `5` atau `10`.
+- **Scenario**: `daily` *(default sesuai tabel Req/day)*, `peak`, `coincident`, atau `smoke`.
+- **Min delay / Max delay**: jeda antar request dalam detik (default `1.0`–`3.0`).
 
-Buka browser ke **`http://localhost:8089`**, lalu isi form:
-1. **Number of users**: jumlah concurrent user virtual (misal `10` untuk pemanasan, `30`–`100` untuk load lebih tinggi).
-2. **Ramp up**: misal `5` atau `10` user/detik.
-3. **Min delay / Max delay**: atur jeda antar endpoint dalam detik (default `1.0`–`3.0`).
-4. Klik **Start swarming**.
-
----
-
-## 4. Cara Menjalankan Tanpa Browser (CLI / Headless)
-
-Contoh menjalankan **20 user** selama **5 menit** dengan delay **1–3 detik** setelah setiap endpoint:
-
+### Via CLI / Headless
 ```powershell
-locust --headless --users 20 --spawn-rate 5 --run-time 5m --min-delay 1.0 --max-delay 3.0
+locust --headless --users 30 --spawn-rate 5 --run-time 5m --scenario daily --min-delay 1.0 --max-delay 3.0
 ```
-
-Simpan laporan HTML:
-
-```powershell
-locust --headless --users 50 --spawn-rate 5 --run-time 15m --min-delay 1.0 --max-delay 2.5 --html report_journey.html
-```
-
----
-
-## 5. Data Uji
-- `data/customers.csv`: data customer untuk user existing & fallback.
-- `data/redemption_customers.csv`: data customer khusus transaksi `redemption`.
